@@ -1,202 +1,128 @@
-
 import streamlit as st
 import pandas as pd
-import json, os, hashlib
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics import precision_score, recall_score, f1_score
 
-# -------------------------
-# Config & paths
-# -------------------------
-DATA_FILE = "cleaned_carbonated_drinks.csv"
-USERS_FILE = "users.json"
-FEEDBACK_FILE = "feedback.json"
-
-# -------------------------
-# Helpers
-# -------------------------
-def load_json(file):
-    if os.path.exists(file):
-        with open(file, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f, indent=4)
-
-def hash_password(password: str):
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-# -------------------------
-# Load dataset
-# -------------------------
-@st.cache_data
-def load_data(path):
-    return pd.read_csv(path)
-
-# -------------------------
-# Build simple TF-IDF recommender
-# -------------------------
+# -----------------------------
+# Load dataset and model
+# -----------------------------
 @st.cache_resource
-def build_vectorizer(df):
-    # combine useful textual features
-    df["features"] = df.get("Flavor", "").fillna("") + " " + df.get("Ingredients", "").fillna("") + " " + df.get("Category","").fillna("")
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=20000)
-    X = vectorizer.fit_transform(df["features"])
-    return vectorizer, X
+def load_model_and_index():
+    df = pd.read_csv("cleaned_carbonated_drinks.csv")
+    df.fillna("", inplace=True)
 
-def recommend(df, vectorizer, X, query, top_k=6, user_history=None):
-    # incorporate user history by appending it to the query (simple personalization)
-    if user_history:
-        history_text = " ".join(user_history[-5:])
-        final_query = query + " " + history_text
-    else:
-        final_query = query
-    qv = vectorizer.transform([final_query])
-    sims = cosine_similarity(qv, X).flatten()
-    idx = sims.argsort()[-top_k:][::-1]
-    return df.iloc[idx].copy(), sims[idx]
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    drink_embeddings = model.encode(df["FlavorProfile"].tolist(), show_progress_bar=False)
 
-# -------------------------
-# App UI
-# -------------------------
-st.set_page_config(page_title="Carbonated Drink Recommender", layout="wide")
+    dimension = drink_embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(drink_embeddings))
 
-# ensure JSON files exist
-for f, default in [(USERS_FILE, {}), (FEEDBACK_FILE, {})]:
-    if not os.path.exists(f):
-        save_json(f, default)
+    return df, model, index, drink_embeddings
 
-# Load data
-if not os.path.exists(DATA_FILE):
-    st.error(f"Dataset file '{DATA_FILE}' not found in app folder. Please add it and reload.")
-    st.stop()
 
-df = load_data(DATA_FILE)
-vectorizer, X = build_vectorizer(df)
+df, model, index, drink_embeddings = load_model_and_index()
 
-# Sidebar navigation
-menu = ["Login/Signup", "Recommendations", "Feedback", "About"]
-choice = st.sidebar.selectbox("Navigation", menu)
+# -----------------------------
+# Helper Functions
+# -----------------------------
+def get_query_embedding(user_input):
+    query = f"{user_input['flavor']} {user_input['use_case']} {user_input['tags']} {user_input['type']}"
+    return model.encode([query])[0]
 
-# -------------------------
-# Auth functions
-# -------------------------
-users = load_json(USERS_FILE)
 
-def signup(username, password):
-    users = load_json(USERS_FILE)
-    if username in users:
-        return False, "Username exists"
-    users[username] = {"password": hash_password(password), "history": [], "favorites": []}
-    save_json(USERS_FILE, users)
-    return True, "Signup successful"
+def get_top_k_recommendations(query_embedding, k=5):
+    D, I = index.search(np.array([query_embedding]), k)
+    return df.iloc[I[0]]
 
-def login(username, password):
-    users = load_json(USERS_FILE)
-    if username in users and users[username]["password"] == hash_password(password):
-        return True, "Login successful"
-    return False, "Invalid credentials"
 
-# -------------------------
-# Pages
-# -------------------------
-if choice == "Login/Signup":
-    st.title("🔐 Login / Signup")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Login")
-        u_login = st.text_input("Username", key="login_user")
-        p_login = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Login"):
-            ok, msg = login(u_login, p_login)
-            if ok:
-                st.session_state["user"] = u_login
-                st.success(msg)
-            else:
-                st.error(msg)
-    with col2:
-        st.subheader("Signup")
-        u_signup = st.text_input("New username", key="signup_user")
-        p_signup = st.text_input("New password", type="password", key="signup_pass")
-        if st.button("Signup"):
-            ok, msg = signup(u_signup, p_signup)
-            if ok:
-                st.success(msg + ". Now login from left panel.")
-            else:
-                st.error(msg)
+def get_relevant_items(user_input, df):
+    relevant = []
+    for _, row in df.iterrows():
+        if user_input['flavor'].lower() in row['FlavorProfile'].lower():
+            relevant.append(row['ProductName'])
+    return relevant
 
-elif choice == "Recommendations":
-    st.title("🥤 Personalized Recommendations")
-    if "user" not in st.session_state:
-        st.warning("Please login first from the Login/Signup page.")
-    else:
-        user = st.session_state["user"]
-        users = load_json(USERS_FILE)  # reload to get latest
-        history = users.get(user, {}).get("history", [])
 
-        st.markdown(f"**Logged in as:** {user}")
-        query = st.text_input("Describe what you want (e.g., low sugar, ginger, caffeine-free, post-workout):", key="query_input")
+def evaluate_model(user_input, recommendations, k):
+    relevant = get_relevant_items(user_input, df)
+    retrieved = recommendations['ProductName'].tolist()
+    retrieved_k = retrieved[:k]
 
-        col1, col2 = st.columns([1,3])
-        with col1:
-            top_k = st.number_input("Number of results", min_value=1, max_value=12, value=6)
-            if st.button("Get Recommendations"):
-                if not query.strip():
-                    st.warning("Please enter a query.")
-                else:
-                    results, scores = recommend(df, vectorizer, X, query, top_k=int(top_k), user_history=history)
-                    # Save user query to history
-                    users = load_json(USERS_FILE)
-                    users.setdefault(user, {"password":"", "history":[], "favorites":[]})
-                    users[user]["history"].append(query)
-                    save_json(USERS_FILE, users)
+    y_true = [1 if item in relevant else 0 for item in retrieved_k]
+    y_pred = [1] * len(retrieved_k)
 
-                    st.subheader("Top recommendations")
-                    for i, row in results.iterrows():
-                        st.write(f"**{row.get('Drink_Name', 'Unknown')}**")
-                        st.write("• Flavor: " + str(row.get("Flavor","")))
-                        st.write("• Ingredients: " + str(row.get("Ingredients","")))
-                        st.write("• Category: " + str(row.get("Category","")))
-                        st.write("---")
-                    st.success("Recommendations generated.")
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
 
-        with col2:
-            st.subheader("Your recent searches")
-            st.write(history[-10:] if history else "No history yet.")
-            st.subheader("Favorites")
-            favs = users.get(user, {}).get("favorites", [])
-            if favs:
-                st.write(favs)
-            else:
-                st.write("No favorites yet.")
+    accuracy = sum([1 for item in retrieved_k if item in relevant]) / k * 100 if k > 0 else 0
+    return accuracy, precision, recall, f1
 
-elif choice == "Feedback":
-    st.title("📝 Feedback")
-    if "user" not in st.session_state:
-        st.warning("Please login first.")
-    else:
-        user = st.session_state["user"]
-        text = st.text_area("Write feedback about recommendations or the app:")
-        if st.button("Submit Feedback"):
-            feedbacks = load_json(FEEDBACK_FILE)
-            feedbacks.setdefault(user, [])
-            feedbacks[user].append({"text": text})
-            save_json(FEEDBACK_FILE, feedbacks)
-            st.success("Thanks for the feedback!")
 
-elif choice == "About":
-    st.title("About this App")
-    st.markdown("""
-    - This is a simple Streamlit app that recommends carbonated drinks using a TF-IDF text-similarity model.
-    - Login/signup data and feedback are stored in `users.json` and `feedback.json`.
-    - To deploy to Streamlit Cloud: push the repo to GitHub and connect the repo in Streamlit Cloud. The main file is `app.py`.
-    """)
+# -----------------------------
+# Streamlit App Layout
+# -----------------------------
+st.set_page_config(page_title="Drink Recommender", layout="wide")
 
-# Footer
-st.sidebar.markdown("---")
-if "user" in st.session_state:
-    if st.sidebar.button("Logout"):
-        st.session_state.pop("user", None)
-        st.experimental_rerun()
+# Sidebar Navigation
+page = st.sidebar.radio("Navigation", ["Login", "Recommendation", "Feedback"])
+
+# -----------------------------
+# Page 1: Login
+# -----------------------------
+if page == "Login":
+    st.title("🔑 Login Page")
+    username = st.text_input("Enter your username")
+    password = st.text_input("Enter your password", type="password")
+    if st.button("Login"):
+        if username and password:
+            st.success(f"Welcome {username} 🎉 You can now go to Recommendation page.")
+        else:
+            st.error("Please enter both username and password!")
+
+# -----------------------------
+# Page 2: Recommendation
+# -----------------------------
+elif page == "Recommendation":
+    st.title("🥤 Personalized Drink Recommender")
+
+    # User Inputs
+    st.subheader("Tell us about your preferences:")
+    flavor = st.text_input("Flavor Preference (e.g., Ginger, Lemon, Cola)")
+    use_case = st.text_input("Use Case (e.g., Gym, Party, Relaxation)")
+    tags = st.text_input("Extra Tags (e.g., Sugar-Free, Caffeine-Free, Low Sugar)")
+    drink_type = st.selectbox("Type of Drink", ["Soda", "Juice", "Energy Drink", "Other"])
+
+    if st.button("Get Recommendations"):
+        if flavor.strip():
+            user_input = {"flavor": flavor, "use_case": use_case, "tags": tags, "type": drink_type}
+            query_embedding = get_query_embedding(user_input)
+            recommendations = get_top_k_recommendations(query_embedding, k=5)
+
+            st.subheader("✅ Top Recommendations for You")
+            st.table(recommendations[["ProductName", "FlavorProfile", "Ingredients"]])
+
+            # Show Evaluation
+            accuracy, precision, recall, f1 = evaluate_model(user_input, recommendations, k=5)
+            st.subheader("📊 Evaluation Metrics")
+            st.write(f"**Accuracy:** {accuracy:.2f}%")
+            st.write(f"**Precision:** {precision:.2f}")
+            st.write(f"**Recall:** {recall:.2f}")
+            st.write(f"**F1 Score:** {f1:.2f}")
+        else:
+            st.warning("Please enter at least a flavor preference.")
+
+# -----------------------------
+# Page 3: Feedback
+# -----------------------------
+elif page == "Feedback":
+    st.title("💬 Feedback Page")
+    feedback_text = st.text_area("Please provide your feedback about our recommendations:")
+    if st.button("Submit Feedback"):
+        if feedback_text.strip():
+            st.success("Thank you for your feedback! 🙏")
+        else:
+            st.warning("Feedback cannot be empty!")
